@@ -1,0 +1,13 @@
+# Versions from the working vOPD environment in OPD_full_orig.
+torch==2.8.0
+transformers==4.57.1
+trl==1.2.0
+vllm==0.11.0
+accelerate==1.15.0
+peft==0.17.1
+datasets==5.0.1
+omegaconf==2.3.1
+psutil==7.2.2
+math-verify==0.8.0
+safetensors==0.8.0
+sentencepiece==0.2.2

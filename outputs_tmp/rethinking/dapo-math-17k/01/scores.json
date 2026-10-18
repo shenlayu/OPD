@@ -1,0 +1,109 @@
+{
+  "module": "rethinking",
+  "dataset": "dapo-math-17k",
+  "experiment": {
+    "label": "DeepSeek / JustRL · 训练前 student",
+    "family": "DeepSeek / JustRL",
+    "student": "DeepSeek-R1-Distill-Qwen-1.5B",
+    "teacher": "JustRL-DeepSeek-1.5B",
+    "evaluated_model": "DeepSeek-R1-Distill-Qwen-1.5B",
+    "method": "student",
+    "role": "student",
+    "checkpoint_step": 0,
+    "training_budget": 0,
+    "training_gpus": 0,
+    "config_overrides": null,
+    "features": [
+      "未蒸馏参考模型"
+    ]
+  },
+  "source_directory": "outputs/external_opd_20261011/rethinking_opd/eval/student",
+  "evaluation": {
+    "samples": 16,
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "max_new_tokens": 31744,
+    "max_model_len": 32768,
+    "stop_token_ids": [
+      151643
+    ],
+    "eos_token_id": 151643,
+    "grader": "author grade_answer_verl; no model verifier",
+    "prompt_style": "chat_author",
+    "enable_thinking": false,
+    "seed": 20261011,
+    "seed_mode": "per_sample",
+    "seed_task_stride": 100000,
+    "seed_example_stride": 32,
+    "stop_mode": "registered_special"
+  },
+  "source_sha256": {
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/scores.json": "fa9f726a5ba5dd940885e0cc22477b53a6321b87a11fece583d7de376214079a",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/graded.jsonl": "66d2118dca2ad217d4939727910cc6cf7a8f21812ce88fea8a2941547260f26c",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_0.protocol.json": "f8ad5b510e1d5b85fd980a25ae10a12bbf88c9a21ac6246f5a7faffc93408f46",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_1.protocol.json": "eacead73acba4e2e4f7e5963bfb72c9acb6ab06cd39912899fb9e9cd66e09dfb",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_2.protocol.json": "c6ec6e575ffa9f68653c010623d73071721dd6948e1ef341246091b282769622",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_3.protocol.json": "3bb1eb181a93f5f33ba07d2ec692ecb01d987f35ef162319678d3c01bc426f20",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_0.jsonl": "fcaa392020246d2ff720f0644b5704f7321d9e3980a8bfe70b4bb7022ec81ad0",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_1.jsonl": "43fcf2b1b2de24d9b1907d15d98d4aa4e46ab7a73859092f32bb783009cadef6",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_2.jsonl": "2719031fc579ccb1b030ca4bd9a57316441a55c873aad7a97364d0d94b7229c8",
+    "outputs/external_opd_20261011/rethinking_opd/eval/student/shard_3.jsonl": "ffac3e0a35dc2c319ee878add13ae28c645c998cc85c21bcbd111c5966338292"
+  },
+  "schema_version": 1,
+  "status": "complete",
+  "results_file": "results.jsonl",
+  "results_sha256": "546a4d1c39e1b159aad3c400f2f0fa039545a4c077dfb15319c2be058da9cb8b",
+  "benchmarks": {
+    "AIME24": {
+      "complete": true,
+      "expected_questions": 30,
+      "samples_per_question": 16,
+      "expected_samples": 480,
+      "completed_samples": 480,
+      "graded_samples": 480,
+      "correct_samples": 155,
+      "grading_errors": 0,
+      "complete_questions": 30,
+      "passed_questions": 20,
+      "avg_at_n_pct": 32.291666666666664,
+      "pass_at_n_pct": 66.66666666666667,
+      "truncated_samples": 47,
+      "truncation_pct": 9.791666666666666,
+      "avg_generated_tokens": 15517.985416666666
+    },
+    "AIME25": {
+      "complete": true,
+      "expected_questions": 30,
+      "samples_per_question": 16,
+      "expected_samples": 480,
+      "completed_samples": 480,
+      "graded_samples": 480,
+      "correct_samples": 105,
+      "grading_errors": 0,
+      "complete_questions": 30,
+      "passed_questions": 14,
+      "avg_at_n_pct": 21.875,
+      "pass_at_n_pct": 46.666666666666664,
+      "truncated_samples": 35,
+      "truncation_pct": 7.291666666666667,
+      "avg_generated_tokens": 15854.622916666667
+    },
+    "AMC23": {
+      "complete": true,
+      "expected_questions": 40,
+      "samples_per_question": 16,
+      "expected_samples": 640,
+      "completed_samples": 640,
+      "graded_samples": 640,
+      "correct_samples": 465,
+      "grading_errors": 0,
+      "complete_questions": 40,
+      "passed_questions": 38,
+      "avg_at_n_pct": 72.65625,
+      "pass_at_n_pct": 95.0,
+      "truncated_samples": 24,
+      "truncation_pct": 3.75,
+      "avg_generated_tokens": 9600.834375
+    }
+  }
+}
