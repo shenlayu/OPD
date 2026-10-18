@@ -1,4 +1,4 @@
-# Versions from the working rethinking environment in OPD_full_orig.
+# Runtime dependencies: Python 3.12, Linux x86_64, PyTorch 2.8 / CUDA 12.8.
 torch==2.8.0
 transformers==4.56.1
 vllm==0.11.0
@@ -15,9 +15,11 @@ pyarrow==25.0.1
 numpy==2.2.6
 codetiming==1.4.0
 dill==0.4.1
-pybind11==3.1.0
 pylatexenc==2.11
 liger-kernel==0.8.2
 latex2sympy2_extended==1.11.0
 math-verify==0.9.0
 psutil==7.2.2
+
+# Official Python 3.12 / torch 2.8 / CUDA 12 / CXX11 ABI=True wheel.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl#sha256=55331d797171973c8babf2b5e5fce5f78859b1cd298d54a136e8994147fe9e95

@@ -1,25 +1,20 @@
 # OPD_lite
 
-只包含 vOPD 和 rethinking 的完整 OPD 链路：读取配置、学生 rollout、教师蒸馏、保存 checkpoint、导出最终模型、独立数学评测。
-每个 module 只有一个用户启动入口和一个 YAML；不依赖 OPD_full_orig。
-
 ## 环境与资产
 
-两个框架的 Transformers / PEFT 版本不同，使用独立 Python 3.12 环境。
+假定已有 Linux x86_64、Python 3.12 和可用的 NVIDIA 驱动。两个框架的 Transformers / PEFT 版本不同，分别安装到独立环境：
 
 ```bash
 python3.12 -m venv .venv-vopd
 .venv-vopd/bin/python -m pip install -r modules/vOPD/requirements.txt
-.venv-vopd/bin/python -m pip install flash-attn==2.8.1 --no-build-isolation
 
 python3.12 -m venv .venv-rethinking
 .venv-rethinking/bin/python -m pip install -r modules/rethinking/requirements.txt
-.venv-rethinking/bin/python -m pip install flash-attn==2.8.1 --no-build-isolation
 ```
 
-依赖版本来自原项目可用环境；Flash Attention 需匹配本机 CUDA/PyTorch。
-本次迁移不复制虚拟环境、权重和数据。下载方式分别见 [model](model/README.md) 和 [data](data/README.md)，每个资源各有占位文档。
-YAML 中的相对路径统一相对于 OPD_lite；已有资产可直接填写本地绝对路径。
+requirements 只列必要依赖，间接依赖由 pip 安装；其中已包含与 PyTorch 2.8 / CUDA 12.8 匹配的官方 Flash Attention wheel，无需额外安装命令。
+
+数据和模型下载分别见两个文件夹的对应 markdown.
 
 ## 启动
 
@@ -32,7 +27,6 @@ YAML 中的相对路径统一相对于 OPD_lite；已有资产可直接填写本
 
 两条命令独立运行，各启动一次实验。默认 vOPD 使用历史 Qwen 1.7B 的 4 GPU 线性 JSD 设置，默认 rethinking 使用 DeepSeek / JustRL 的 4 GPU 原生 top-16 OPD。
 两者默认训练 1 epoch 并自动评估最终 checkpoint；可用 `evaluation.enabled: false` 关闭最终评测。
-默认完整数据集和多次采样评测会产生实质算力开销，迁移检查不会自动开始这些训练。
 
 ```bash
 # 只校验配置、查看最终参数；不占 GPU、不下载资源、不创建实验目录。
@@ -87,12 +81,3 @@ Ray 的内部运行日志位于该实验的临时目录，退出时清理；只�
 vOPD 设置 `training.resume_from_checkpoint` 为已有 `checkpoint-N`；
 rethinking 设置 `training.trainer.resume_mode: resume_path` 和 `training.trainer.resume_from_path` 为已有 `global_step_N`。
 每次启动仍建立新编号，保留原实验。渐进 JSD 的总步数是调度预算，恢复同一实验时应保持原预算。
-
-CPU 数值和迁移回归检查：
-
-```bash
-.venv-rethinking/bin/python -m pip install pytest
-PYTHONPATH=.:modules/rethinking .venv-rethinking/bin/python -m pytest -q -p no:cacheprovider tests
-```
-
-源代码与删减范围记录见 [迁移说明](docs/migration.md)。

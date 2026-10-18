@@ -1,4 +1,4 @@
-# Versions from the working vOPD environment in OPD_full_orig.
+# Runtime dependencies: Python 3.12, Linux x86_64, PyTorch 2.8 / CUDA 12.8.
 torch==2.8.0
 transformers==4.57.1
 trl==1.2.0
@@ -11,3 +11,6 @@ psutil==7.2.2
 math-verify==0.8.0
 safetensors==0.8.0
 sentencepiece==0.2.2
+
+# Official Python 3.12 / torch 2.8 / CUDA 12 / CXX11 ABI=True wheel.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl#sha256=55331d797171973c8babf2b5e5fce5f78859b1cd298d54a136e8994147fe9e95

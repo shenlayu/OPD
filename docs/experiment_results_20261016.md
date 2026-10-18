@@ -1,7 +1,5 @@
 # OPD 历史实验结果
 
-旧汇总日期：2026-10-16；迁移日期：2026-10-18。这里收录 vOPD 13 组、rethinking 18 组，共 31 组，保留 144,484 条模型回答及原判分。
-
 每组只含 `scores.json`、`results.jsonl`、`README.md`；路径为 `outputs/<module>/<训练数据>/<编号>/`。组名链接进入 feature、参数和来源说明。未迁移历史代码、checkpoint、模型、数据、日志和评测分片。
 
 表格为 **Avg / Pass@n（%）**：Avg=正确回答数/全部回答数；Pass@n=至少答对一次的题数/题目数。`—` 表示未评测。未完成的 benchmark 仅展示已保存数量，分数 JSON 中最终准确率为 `null`。详见 [结果格式](results_format.md)。
@@ -92,11 +90,3 @@ Student：`Qwen3-1.7B-Base` → Teacher：`Qwen3-1.7B`。
 Entropy基础映射为 α=u^(1+Hbits)，power为 α=u^((1+Hbits)^λ)；tempered组在后半程将β从1提高到1.25。定义见 [Entropy JSD](notes/entropy_jsd.md)，配置开关见 [features](features/rethinking.md)。
 
 cosine组训练与导出完成，评测保存1,572/1,600条：AIME24 480/480、AIME25 473/480、AMC23 619/640。后两项没有最终分数。没有此rethinking协议下Qwen训练前student的完整评测，不能用vOPD的student分数替代。
-
-## 迁移依据与边界
-
-来源为 OPD_full_orig/docs/experiment_results_20261016.md 的两个 module 主表，以及对应旧结果、训练元数据和评测协议。每组 scores.json 保留来源路径和源文件SHA256；结果流另有SHA256，便于检查完整性。
-
-复核了题目/采样数、唯一键、正确数、通过题数、Avg/Pass及vOPD原多数投票/格式率；rethinking逐条对齐原始生成和graded标签。没有重新生成回答或重新判分。缺失的历史token_count/finish_reason保持null。
-
-按用户限定范围，不收入MiniLLM、smoke、schedule pilot、stop-token/grader协议探针、gap分布和其他诊断产物。三份方法笔记保留在docs/notes；未实现候选有明确标注。
