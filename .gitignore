@@ -9,3 +9,4 @@ outputs/
 /model/*
 !/model/*.md
 tests/
+/.gpu_locks/

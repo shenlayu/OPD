@@ -48,6 +48,16 @@ if __name__ == "__main__":
         raise ValueError(
             "Dense distillation requires aligned student/teacher token IDs"
         )
+    generation_stops = list(getattr(args, "generation_stop_token_ids", []))
+    if generation_stops:
+        if not args.use_vllm:
+            raise ValueError("Explicit multi-EOS protocol currently requires vLLM")
+        # GRPO's termination statistics recognize tokenizer EOS and PAD. Qwen's
+        # teacher EOS is im_end and its PAD/base EOS is endoftext, covering both.
+        if set(generation_stops) != {tokenizer.pad_token_id, teacher_tokenizer.eos_token_id}:
+            raise ValueError("Explicit stops must match student PAD/base EOS and teacher EOS")
+        tokenizer.eos_token = teacher_tokenizer.eos_token
+        print(f"Training stop IDs: {generation_stops}; tokenizer EOS: {tokenizer.eos_token_id}", flush=True)
     del teacher_tokenizer
 
     def _to_train_prompt(ex: dict[str, Any]) -> dict[str, str]:
@@ -159,6 +169,8 @@ if __name__ == "__main__":
         "teacher_model_init_kwargs": teacher_model_init_kwargs,
     }
     training_args = MiniLLMConfig(**safe_init_kwargs(MiniLLMConfig, config_kwargs))
+    if generation_stops:
+        training_args.generation_kwargs = {"stop_token_ids": generation_stops}
 
     peft_config = None
     if args.use_peft:
@@ -191,6 +203,8 @@ if __name__ == "__main__":
         alpha_schedule=getattr(args, "alpha_schedule", "linear"),
         loss_token_chunk_size=getattr(args, "loss_token_chunk_size", 128),
         prompt_length_limit=args.max_prompt_length,
+        stop_weight=getattr(args, "stop_weight", 0.0),
+        stop_token_ids=list(getattr(args, "stop_token_ids", [])),
     )
 
     # TRL materializes the teacher dtype in-place while loading the model.
@@ -233,6 +247,9 @@ if __name__ == "__main__":
     trainer.save_model(final_dir)
     if trainer.is_world_process_zero():
         tokenizer.save_pretrained(final_dir)
+        if generation_stops:
+            trainer.model.generation_config.eos_token_id = generation_stops
+            trainer.model.generation_config.save_pretrained(final_dir)
         print(
             f"Training complete: step={trainer.state.global_step}; metrics={result.metrics}",
             flush=True,

@@ -9,7 +9,7 @@ from trl.experimental.minillm import MiniLLMTrainer
 from trl.trainer.utils import selective_log_softmax
 
 from modules.vOPD.src.grad_variance import GradientVarianceTracker
-from modules.vOPD.src.progressive_jsd import dense_jsd_loss, linear_alpha
+from modules.vOPD.src.progressive_jsd import dense_jsd_loss, entropy_alpha_totals, linear_alpha
 
 
 class CustomMiniLLMTrainer(MiniLLMTrainer):
@@ -28,6 +28,8 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
         alpha_schedule: str = "linear",
         loss_token_chunk_size: int = 128,
         prompt_length_limit: int = 1024,
+        stop_weight: float = 0.0,
+        stop_token_ids=(),
         **kwargs,
     ):
         if reward_clip_lambda is not None and not 0.0 < reward_clip_lambda < 1.0:
@@ -38,13 +40,24 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
         linear_alpha(0, 2, alpha_start, alpha_end)
         self.dense_objective = dense_objective
         self.alpha_start, self.alpha_end = alpha_start, alpha_end
-        if alpha_schedule not in {"linear", "teacher_entropy"}:
+        if alpha_schedule not in {"linear", "teacher_entropy", "teacher_entropy_mean"}:
             raise ValueError(f"Unknown alpha schedule: {alpha_schedule}")
         if dense_objective == "reverse_kl" and alpha_schedule != "linear":
             raise ValueError("Reverse KL requires the unmodified endpoint schedule")
         self.alpha_schedule = alpha_schedule
+        if alpha_schedule == "teacher_entropy_mean":
+            if dense_objective != "progressive_jsd":
+                raise ValueError("Aggregated entropy requires progressive_jsd")
+            if self.args.steps_per_generation != self.args.gradient_accumulation_steps or self.num_iterations != 1:
+                raise ValueError("Aggregated entropy requires one generation batch per optimizer update")
         self.loss_token_chunk_size = loss_token_chunk_size
         self.prompt_length_limit = prompt_length_limit
+        self.stop_weight = float(stop_weight)
+        self.stop_token_ids = tuple(stop_token_ids)
+        if not math.isfinite(self.stop_weight) or self.stop_weight < 0:
+            raise ValueError("stop_weight must be finite and nonnegative")
+        if self.stop_weight and (dense_objective == "upstream" or not self.stop_token_ids):
+            raise ValueError("Stop auxiliary requires a dense objective and explicit stop IDs")
         if dense_objective != "upstream":
             # GRPO disables Trainer's accumulation scaling for its own loss;
             # restore it for a standard differentiable mean divergence.
@@ -296,6 +309,57 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
             multimodal_fields,
         )
 
+    def _distill_progress(self):
+        return (1.0 if self.dense_objective == "reverse_kl" else linear_alpha(
+            self.state.global_step, self.state.max_steps, self.alpha_start, self.alpha_end,
+        ))
+
+    @torch.no_grad()
+    def _aggregate_entropy_alpha(self, inputs, progress):
+        """One token-weighted alpha for the full generation/optimizer batch.
+
+        Precompute before GRPO shuffles/splits the generation batch. Teacher
+        forwards stay microbatched; only two FP64 totals cross GPU boundaries.
+        No student forward, sampling or RNG consumption is added here.
+        """
+        if progress in (0, 1):
+            return progress
+        totals = inputs["completion_ids"].new_zeros(2, dtype=torch.float64)
+        batch_size = self.args.per_device_train_batch_size
+        self.teacher_model.eval()
+        for offset in range(0, inputs["prompt_ids"].shape[0], batch_size):
+            sl = slice(offset, offset + batch_size)
+            ids = torch.cat((inputs["prompt_ids"][sl], inputs["completion_ids"][sl]), dim=1)
+            mask = torch.cat((inputs["prompt_mask"][sl], inputs["completion_mask"][sl]), dim=1)
+            positions = mask.long().cumsum(-1) - 1
+            positions.masked_fill_(mask == 0, 0)
+            output = self.teacher_model(
+                input_ids=ids, attention_mask=mask, position_ids=positions, use_cache=False,
+            )
+            start = inputs["prompt_ids"].shape[1] - 1
+            totals += entropy_alpha_totals(
+                output.logits[:, start:-1, :] / self.kd_temperature,
+                inputs["completion_mask"][sl], progress, self.loss_token_chunk_size,
+            )
+            del output
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        if totals[1].item() <= 0:
+            raise ValueError("Aggregated entropy batch has no valid response tokens")
+        return (totals[0] / totals[1]).item()
+
+    def _generate_and_score_completions(self, inputs):
+        result = super()._generate_and_score_completions(inputs)
+        if self.alpha_schedule == "teacher_entropy_mean":
+            alpha = self._aggregate_entropy_alpha(result, self._distill_progress())
+            # A per-sequence field survives GRPO's shuffle and microbatch split;
+            # every sequence/rank/accumulation slice carries the SAME scalar.
+            result["distill_shared_alpha"] = torch.full(
+                (result["prompt_ids"].shape[0],), alpha,
+                device=result["prompt_ids"].device, dtype=torch.float64,
+            )
+        return result
+
     def compute_dense_loss(self, model, inputs, return_outputs=False):
         input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
         attention_mask = torch.cat(
@@ -317,33 +381,34 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
             teacher = self.teacher_model(**kwargs)
         q = student.logits[:, prompt_length - 1 : -1, :]
         p = teacher.logits[:, prompt_length - 1 : -1, :]
-        alpha = (
-            1.0
-            if self.dense_objective == "reverse_kl"
-            else linear_alpha(
-                self.state.global_step,
-                self.state.max_steps,
-                self.alpha_start,
-                self.alpha_end,
-            )
-        )
+        progress = self._distill_progress()
+        alpha, schedule = progress, self.alpha_schedule
+        if schedule == "teacher_entropy_mean":
+            alpha = inputs["distill_shared_alpha"][0].item()
+            schedule = "linear"  # Apply the precomputed scalar without a second entropy transform.
         loss, alpha_stats = dense_jsd_loss(
             q / self.kd_temperature,
             p / self.kd_temperature,
             inputs["completion_mask"],
             alpha,
             self.loss_token_chunk_size,
-            alpha_schedule=self.alpha_schedule,
+            alpha_schedule=schedule,
             return_alpha_stats=True,
+            stop_weight=self.stop_weight,
+            stop_token_ids=self.stop_token_ids,
         )
         mode = "train" if self.model.training else "eval"
         self._metrics[mode]["distill/alpha"].append(alpha_stats["mean"].item())
-        self._metrics[mode]["distill/alpha_progress"].append(alpha)
-        if self.alpha_schedule == "teacher_entropy":
+        self._metrics[mode]["distill/alpha_progress"].append(progress)
+        if self.alpha_schedule in {"teacher_entropy", "teacher_entropy_mean"}:
             self._metrics[mode]["distill/alpha_floor_fraction"].append(
                 alpha_stats["floor_fraction"].item()
             )
         self._metrics[mode]["distill/loss"].append(loss.detach().item())
+        if self.stop_weight:
+            for key in ("primary_loss", "stop_loss", "teacher_stop_probability", "student_stop_probability"):
+                self._metrics[mode]["distill/" + key].append(alpha_stats[key].item())
+            self._metrics[mode]["distill/stop_weight"].append(self.stop_weight)
         self._metrics[mode]["distill/completion_tokens"].append(
             inputs["completion_mask"].sum().item()
         )

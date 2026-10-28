@@ -29,6 +29,10 @@ def load_config(module, filename, overrides=(), root=ROOT):
     config = OmegaConf.load(filename)
     if set(config) != {"run", "training", "evaluation"}:
         raise ValueError("Config requires exactly run, training, evaluation sections")
+    if module == "vOPD":
+        config.training.setdefault("stop_weight", 0.0)
+        config.training.setdefault("stop_token_ids", [])
+        config.training.setdefault("generation_stop_token_ids", [])
     OmegaConf.set_struct(config, True)
     # YAML 1.1 otherwise parses the natural CLI spelling dense_distill_mode=off
     # as a boolean, although this field is an objective name.
@@ -95,6 +99,14 @@ def load_config(module, filename, overrides=(), root=ROOT):
         raise ValueError(
             "Evaluation tensor_parallel_size must divide the number of GPUs"
         )
+    evaluation_dp = e.get("data_parallel_size", 1)
+    if type(evaluation_dp) is not int or evaluation_dp < 1:
+        raise ValueError("Evaluation data_parallel_size must be a positive integer")
+    if evaluation_dp * e.tensor_parallel_size > len(gpu_ids):
+        raise ValueError("Evaluation data and tensor parallelism exceed run.gpus")
+    allowed_parallel_seed = e.seed_mode == "per_sample" or (module == "vOPD" and e.seed_mode == "engine")
+    if evaluation_dp > 1 and (e.tensor_parallel_size != 1 or not allowed_parallel_seed):
+        raise ValueError("Parallel evaluation requires TP=1 and per-sample seeds, or vOPD engine question shards")
     t = config.training
     if module == "vOPD":
         for key in ["dataset_name", "model_name_or_path", "teacher_model_name_or_path"]:
@@ -104,6 +116,19 @@ def load_config(module, filename, overrides=(), root=ROOT):
             t.resume_from_checkpoint = local_path(t.resume_from_checkpoint, root)
         if t.dense_objective not in {"upstream", "progressive_jsd", "reverse_kl"}:
             raise ValueError("Unknown dense_objective")
+        if not math.isfinite(t.stop_weight) or t.stop_weight < 0:
+            raise ValueError("stop_weight must be finite and nonnegative")
+        for key in ("stop_token_ids", "generation_stop_token_ids"):
+            ids = list(t[key])
+            if len(set(ids)) != len(ids) or any(type(i) is not int or i < 0 for i in ids):
+                raise ValueError(f"Invalid {key}")
+        if t.stop_weight and (t.dense_objective == "upstream" or not t.stop_token_ids):
+            raise ValueError("Stop auxiliary requires dense objective and stop_token_ids")
+        if t.generation_stop_token_ids and (
+            not t.use_vllm or e.stop_mode != "registered_special"
+            or (t.stop_weight and set(t.stop_token_ids) != set(t.generation_stop_token_ids))
+        ):
+            raise ValueError("Training, evaluation and auxiliary stop protocols must agree")
         if t.distill_mode not in {"tml", "gkd_rkl"}:
             raise ValueError("distill_mode must be tml or gkd_rkl")
         if t.dense_objective != "upstream" and (
@@ -114,8 +139,10 @@ def load_config(module, filename, overrides=(), root=ROOT):
             )
         if not 0 <= t.alpha_start <= t.alpha_end <= 1:
             raise ValueError("Require 0 <= alpha_start <= alpha_end <= 1")
-        if t.alpha_schedule not in {"linear", "teacher_entropy"}:
+        if t.alpha_schedule not in {"linear", "teacher_entropy", "teacher_entropy_mean"}:
             raise ValueError("Unknown alpha_schedule")
+        if t.alpha_schedule == "teacher_entropy_mean" and t.dense_objective != "progressive_jsd":
+            raise ValueError("Aggregated entropy requires progressive_jsd")
         if t.dense_objective == "reverse_kl" and t.alpha_schedule != "linear":
             raise ValueError("reverse_kl requires alpha_schedule=linear")
         if t.report_to != "none":
@@ -248,9 +275,13 @@ def load_config(module, filename, overrides=(), root=ROOT):
     return config
 
 
-def validate_assets(config, module):
+def validate_assets(config, module, *, evaluation_only=False):
     t = config.training
-    if module == "vOPD":
+    if evaluation_only:
+        if module != "vOPD":
+            raise ValueError("Student-only asset validation is supported for vOPD")
+        models, data, resume = [t.model_name_or_path], [], None
+    elif module == "vOPD":
         models = [
             t.model_name_or_path,
             t.teacher_model_name_or_path or t.model_name_or_path,
@@ -532,6 +563,11 @@ def launch(module, default_config):
                     code,
                     log,
                 )
+                if module == "vOPD" and config.evaluation.get("complete_box_scoring", False):
+                    run_command(
+                        [python, "-m", "scripts.diagnose_complete_boxes", str(run)],
+                        env, code, log,
+                    )
             print("Experiment completed", file=log, flush=True)
         except BaseException as error:
             print(f"Experiment failed: {error}", file=log, flush=True)
