@@ -72,6 +72,11 @@ AMC23 只保留 2023 年的 40 题，AIME25 只使用完整的 30 题，不叠�
 请等待上一条命令结束后再执行下一条；也可以使用下方顺序脚本。
 
 ```bash
+
+# 评测 student
+.venv-vopd/bin/python scripts/evaluate_vopd_student.py \
+  --config configs/deepseek_jsd_ablation/00_student.yaml
+
 # 实验 1：去掉散度的时间调度，固定 u=0.5；token entropy 区分保留
 .venv-vopd/bin/python scripts/run_vopd_ablation.py \
   --config configs/deepseek_jsd_ablation/01_entropy_static.yaml
