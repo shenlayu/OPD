@@ -136,6 +136,7 @@ class CoreAblationTests(unittest.TestCase):
                         ["training.token_gate_normalize=false"])
 
     def test_configs_change_only_the_ablated_keys(self):
+        # Training matches A04 except the ablated keys; evaluation is 32k tokens x 8 rollouts.
         baseline = OmegaConf.to_container(load_config("vOPD", ROOT / "configs/deepseek_token_gate/04_jsd_q05.yaml"))
         keys = ("dense_objective", "token_gate_clip", "token_gate_beta", "token_gate_normalize")
         for name, expected in CONFIGS.items():
@@ -143,10 +144,19 @@ class CoreAblationTests(unittest.TestCase):
             validate_assets(config, "vOPD")
             self.assertEqual(config.run.dataset, f"dapo14k_deepseek_core_{name}")
             self.assertEqual(tuple(config.training[k] for k in keys), expected)
+            e = config.evaluation
+            self.assertTrue(e.enabled)
+            self.assertEqual([(t.name, t.samples, t.limit) for t in e.datasets],
+                             [(n, 8, None) for n in ("math500", "minerva", "amc23", "aime24", "aime25")])
+            self.assertEqual((e.max_new_tokens, e.max_model_len), (32768, 33792))
             probe, reference = OmegaConf.to_container(config), dict(baseline)
             for item in (probe, reference):
                 item["run"] = {k: v for k, v in item["run"].items() if k != "dataset"}
                 item["training"] = {k: v for k, v in item["training"].items() if k not in keys}
+                item["evaluation"] = {k: v for k, v in item["evaluation"].items()
+                                      if k not in {"max_new_tokens", "max_model_len"}}
+                item["evaluation"]["datasets"] = [{k: v for k, v in d.items() if k != "samples"}
+                                                  for d in item["evaluation"]["datasets"]]
             self.assertEqual(probe, reference)
         script = (ROOT / "configs/deepseek_core_ablation/run_all.sh").read_text()
         self.assertIn(f"for ablation_name in {' '.join(CONFIGS)}; do", script)

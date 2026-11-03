@@ -24,9 +24,9 @@ student 已同意时自动退回 RKL；在极端漏看处再给拉力封顶。
 
 实现见 `modules/vOPD/src/token_gate.py`，主配置是 `configs/deepseek_token_gate/04_jsd_q05.yaml`（下文称 A04）。
 
-**现状。** DeepSeek-R1-Distill-Qwen-1.5B ← JustRL-DeepSeek-1.5B，单 seed：8k avg@4 五项宏平均 A04 47.17，纯 RKL 43.32；
-32k avg@16 上 JSD − RKL = +1.04，区间 [−0.22, +2.34]（只对题目 bootstrap）。
-已经做过 τ_q 扫描、JSD vs KL 混合、ψ 的形状，以及 stop 通道、方案 B、偏好差门控、事后门控、CE 替换等附加部件（都没有带来提升）。
+**现状。** DeepSeek-R1-Distill-Qwen-1.5B ← JustRL-DeepSeek-1.5B，单 seed：32k avg@16 五项宏平均 A04 52.66，纯 RKL 51.62，
+差 +1.04，区间 [−0.22, +2.34]（只对题目 bootstrap）；8k avg@4 上是 47.17 vs 43.32。
+已经做过（都在 8k avg@4 下）τ_q 扫描、JSD vs KL 混合、ψ 的形状，以及 stop 通道、方案 B、偏好差门控、事后门控、CE 替换等附加部件（都没有带来提升）。
 **三个组件还没有单独证明有效：限幅、门控 vs 常数 β、归一化**。下面五组实验就是补这三个消融。
 
 ## vOPD DeepSeek：五组核心消融（限幅 / 常数 β / 归一化）
@@ -124,7 +124,7 @@ bash configs/deepseek_core_ablation/run_all.sh
 ### 5. 评测、保存与结果位置
 
 - 所有配置使用 GPU 0–7，需要八张空闲卡；启动时任一卡已占用超过 1 GiB 显存会直接退出，不会与别的任务重叠。
-  八卡上每组训练加评测约 1 小时，五组约 5 小时。
+  按此前的训练和 32k 评测耗时估算，八卡上每组约 1.5–2 小时，五组约 8–10 小时。
 - 不要改卡数和梯度累积。只有四张卡时，可以在命令末尾加
   `'run.gpus=[0,1,2,3]' training.gradient_accumulation_steps=16 evaluation.max_parallel_workers=4`，
   保持全局 batch=64、评测仍为 8 个题目分片（分两轮），但要在结果里注明，因为训练随机流会变。
@@ -132,25 +132,29 @@ bash configs/deepseek_core_ablation/run_all.sh
   启动时会核对初始 LoRA 的 SHA256；如果报 `Paired LoRA initialization mismatch`，请记录报错并告知，不要删掉该字段后继续跑。
 - 训练成功后自动评测 **final checkpoint**。50、100、150、200、211 步 checkpoint 都会保存，
   **中间 checkpoint 不会自动评测**。
-- 评测 MATH500、Minerva、AMC23、AIME24、AIME25，每题 4 条；temperature=0.6、top_p=0.9、回答上限 8192 tokens。
+- 评测 MATH500、Minerva、AMC23、AIME24、AIME25 五个 benchmark，每题 8 条；
+  temperature=0.6、top_p=0.9、回答上限 32768 tokens（8192×4，总长度上限 33792）。
 - 结果在 `outputs/vOPD/dapo14k_deepseek_core_<配置名>/<日期>/<编号>/` 下，每次启动创建新编号。
   每次运行保留 `main.log`、`configs/`、`code/`、`scores.json`、`results.jsonl`、
   `diagnostics/complete_box_scores.json` 和 `checkpoint/`。
-- 成绩统一读 `diagnostics/complete_box_scores.json` 中的 **`last_complete`**；宏平均为五项 avg@4 等权平均。
+- 成绩统一读 `diagnostics/complete_box_scores.json` 中的 **`last_complete`**；宏平均为五项 avg@8 等权平均。
 - 跑完后在 `main.log` 的训练日志里顺手确认开关生效：01–04 的 `token_gate/clip_fraction` 恒为 0；
   03、04 的 `token_gate/gate_fraction` 为 1，`token_gate/beta` 分别为 0.5、1.0；
   05 的 `token_gate/clip_fraction` 应与 A04 同量级（均值约 0.6%）。
 
 ### 6. 填写结果
 
-跑完一组填一行，在完成人一栏写自己的名字。前三行是已有对照，不需要重跑。
-同一配置运行间差约 2.5pp（A04 的两次梯度等价复现分别为 44.67 和 45.33），单组差值小于这个量级时不要下结论。
+跑完一组填一行（每格填 avg@8），在完成人一栏写自己的名字。前几行是已有对照，不需要重跑。
+已有结果同样是回答上限 32768、`last_complete` 判分，但每题 16 条（avg@16）。
+avg@n 的期望不随 n 变化，可以直接和 avg@8 比，只是方差更小。
+32k 下只有 A04 与其 4 卡梯度等价复现 B2048_psi0 这一对（差 0.68pp），运行间噪声还没有可靠估计，单组小差值不要下结论。
+A01 还没有 32k 结果，02 组暂时缺这一格对照。
 
-| ID | 实验 | MATH500 | Minerva | AMC23 | AIME24 | AIME25 | 宏 avg@4 | 完成人 |
+| ID | 实验 | MATH500 | Minerva | AMC23 | AIME24 | AIME25 | 宏 avg | 完成人 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| A04 | JSD q05，带限幅（已有） | 80.30 | 30.15 | 68.75 | 34.17 | 22.50 | 47.17 | — |
-| A01 | KL 混合 q05，带限幅（已有） | 78.05 | 29.23 | 53.13 | 35.00 | 23.33 | 43.75 | — |
-| A07 | 纯 RKL（已有） | 79.50 | 28.95 | 55.63 | 31.67 | 20.83 | 43.32 | — |
+| B2048_psi0 | JSD q05，带限幅（A04 的梯度等价复现，4 卡；已有，avg@16） | 84.39 | 31.41 | 77.34 | 42.92 | 30.63 | 53.34 | — |
+| A07 | 纯 RKL（已有，avg@16） | 82.95 | 32.01 | 74.38 | 42.71 | 26.04 | 51.62 | — |
+| A01 | KL 混合 q05，带限幅（32k 未测） | | | | | | | |
 | 01 | JSD q05，无限幅 | | | | | | | |
 | 02 | KL 混合 q05，无限幅 | | | | | | | |
 | 03 | 固定 β=0.5 JSD | | | | | | | |
