@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import json
 import math
 import os
 from pathlib import Path
@@ -17,6 +20,8 @@ import time
 
 from omegaconf import OmegaConf
 
+from scripts.cleanup_checkpoints import cleanup_after_evaluation
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -29,10 +34,29 @@ def load_config(module, filename, overrides=(), root=ROOT):
     config = OmegaConf.load(filename)
     if set(config) != {"run", "training", "evaluation"}:
         raise ValueError("Config requires exactly run, training, evaluation sections")
+    if module == "rethinking":
+        # Apply to every existing experiment YAML without editing frozen runs.
+        config.training.trainer.setdefault("rollout_data_dir", None)
+        config.training.trainer.setdefault("rollout_samples_per_step", 20)
     if module == "vOPD":
+        from modules.vOPD.src.token_progress_config import ProgressConfig
+        from modules.vOPD.src.token_response import ResponseConfig
+
         config.training.setdefault("stop_weight", 0.0)
         config.training.setdefault("stop_token_ids", [])
         config.training.setdefault("generation_stop_token_ids", [])
+        for key, value in dict(token_gate_tau_q=0.5, token_gate_stop=False,
+                               token_gate_stop_ids=[], token_gate_k_odds=1.0,
+                               token_gate_clip=None, token_gate_ce_weight=None,
+                               token_gate_beta=None, token_gate_normalize=True).items():
+            config.training.setdefault(key, value)
+        config.training.token_gate_progress = OmegaConf.merge(
+            ProgressConfig().to_dict(), config.training.get("token_gate_progress", {})
+        )
+        config.training.token_gate_response = OmegaConf.merge(
+            ResponseConfig().to_dict(), config.training.get("token_gate_response", {})
+        )
+    config.evaluation.setdefault("max_parallel_workers", None)
     OmegaConf.set_struct(config, True)
     # YAML 1.1 otherwise parses the natural CLI spelling dense_distill_mode=off
     # as a boolean, although this field is an objective name.
@@ -102,20 +126,55 @@ def load_config(module, filename, overrides=(), root=ROOT):
     evaluation_dp = e.get("data_parallel_size", 1)
     if type(evaluation_dp) is not int or evaluation_dp < 1:
         raise ValueError("Evaluation data_parallel_size must be a positive integer")
-    if evaluation_dp * e.tensor_parallel_size > len(gpu_ids):
+    workers = e.max_parallel_workers if e.max_parallel_workers is not None else evaluation_dp
+    if type(workers) is not int or not 1 <= workers <= evaluation_dp:
+        raise ValueError("max_parallel_workers must be between 1 and data_parallel_size")
+    if workers * e.tensor_parallel_size > len(gpu_ids):
         raise ValueError("Evaluation data and tensor parallelism exceed run.gpus")
     allowed_parallel_seed = e.seed_mode == "per_sample" or (module == "vOPD" and e.seed_mode == "engine")
     if evaluation_dp > 1 and (e.tensor_parallel_size != 1 or not allowed_parallel_seed):
         raise ValueError("Parallel evaluation requires TP=1 and per-sample seeds, or vOPD engine question shards")
     t = config.training
     if module == "vOPD":
+        progress_config = ProgressConfig.parse(OmegaConf.to_container(t.token_gate_progress, resolve=True))
+        response_config = ResponseConfig.parse(OmegaConf.to_container(t.token_gate_response, resolve=True))
+        response_config.validate_context(t.dense_objective, t.token_gate_stop, progress_config.enabled,
+                                         t.token_gate_ce_weight, list(t.token_gate_stop_ids))
+        if t.token_gate_ce_weight is not None:
+            if not math.isfinite(t.token_gate_ce_weight) or t.token_gate_ce_weight < 0:
+                raise ValueError("token_gate_ce_weight must be finite and nonnegative, or null")
+            if t.dense_objective != "token_jsd" or t.token_gate_stop or progress_config.enabled:
+                raise ValueError("CE replacement requires token_jsd without split-stop or Scheme B")
+        if progress_config.enabled and t.dense_objective not in {"token_mix", "token_jsd"}:
+            raise ValueError("Scheme B requires token_mix or token_jsd")
         for key in ["dataset_name", "model_name_or_path", "teacher_model_name_or_path"]:
             if t[key]:
                 t[key] = local_path(t[key], root)
         if t.resume_from_checkpoint:
             t.resume_from_checkpoint = local_path(t.resume_from_checkpoint, root)
-        if t.dense_objective not in {"upstream", "progressive_jsd", "reverse_kl"}:
+        if t.dense_objective not in {"upstream", "progressive_jsd", "reverse_kl", "token_mix", "token_jsd"}:
             raise ValueError("Unknown dense_objective")
+        if t.dense_objective in {"token_mix", "token_jsd"}:
+            if not 0 <= t.token_gate_tau_q <= 1 or type(t.token_gate_stop) is not bool:
+                raise ValueError("Invalid token gate threshold or stop switch")
+            ids = list(t.token_gate_stop_ids)
+            if not ids or len(set(ids)) != len(ids) or any(type(i) is not int or i < 0 for i in ids):
+                raise ValueError("Invalid token_gate_stop_ids")
+            if t.token_gate_k_odds != 1 or t.stop_weight or t.alpha_schedule != "linear":
+                raise ValueError("Token gate requires k_odds=1, stop_weight=0 and no time schedule")
+            if t.token_gate_clip is not None and (math.isnan(t.token_gate_clip) or t.token_gate_clip <= 0):
+                raise ValueError("Invalid token_gate_clip")
+            from modules.vOPD.src.token_gate import validate_ablation
+            validate_ablation(t.dense_objective, t.token_gate_beta, t.token_gate_normalize, t.token_gate_clip,
+                              t.token_gate_stop, progress_config.enabled, t.token_gate_ce_weight,
+                              response_config.enabled)
+            if t.resume_from_checkpoint and t.token_gate_clip is None and not progress_config.enabled:
+                raise ValueError("Resume must supply token_gate_clip from diagnostics/token_gate_calibration.json")
+            if t.resume_from_checkpoint and progress_config.enabled:
+                if not (Path(t.resume_from_checkpoint) / "token_progress_state.json").is_file():
+                    raise ValueError("Scheme B resume requires token_progress_state.json in the checkpoint")
+        elif t.token_gate_beta is not None or t.token_gate_normalize is not True:
+            raise ValueError("token_gate_beta / token_gate_normalize require token_mix or token_jsd")
         if not math.isfinite(t.stop_weight) or t.stop_weight < 0:
             raise ValueError("stop_weight must be finite and nonnegative")
         for key in ("stop_token_ids", "generation_stop_token_ids"):
@@ -168,6 +227,8 @@ def load_config(module, filename, overrides=(), root=ROOT):
             )
         lr = t.learning_rate
     else:
+        if type(t.trainer.rollout_samples_per_step) is not int or t.trainer.rollout_samples_per_step < 0:
+            raise ValueError("rollout_samples_per_step must be a nonnegative integer")
         a, r, m = (
             t.actor_rollout_ref.actor,
             t.actor_rollout_ref.rollout,
@@ -220,7 +281,7 @@ def load_config(module, filename, overrides=(), root=ROOT):
             raise ValueError(
                 "train_batch_size must be divisible by ppo_mini_batch_size"
             )
-        if a.dense_distill_mode not in {"off", "rkl", "linear_jsd", "entropy_jsd"}:
+        if a.dense_distill_mode not in {"off", "rkl", "linear_jsd", "entropy_jsd", "research"}:
             raise ValueError("Unknown dense_distill_mode")
         if not all(
             math.isfinite(x) and x >= 1
@@ -231,6 +292,20 @@ def load_config(module, filename, overrides=(), root=ROOT):
             )
         if a.dense_token_chunk_size < 1:
             raise ValueError("dense_token_chunk_size must be positive")
+        schedule_updates = a.get("dense_schedule_updates")
+        if schedule_updates is not None and (isinstance(schedule_updates, bool)
+                or not isinstance(schedule_updates, int) or schedule_updates < 2):
+            raise ValueError("dense_schedule_updates must be an integer >=2")
+        from modules.rethinking.progressive.config import validate_seq_weight
+        seq = validate_seq_weight(a.get("dense_seq_weight", {}))
+        seq_enabled = seq["mode"] != "off"
+        if seq_enabled:
+            if a.dense_distill_mode not in {"linear_jsd", "entropy_jsd"}:
+                raise ValueError("Dense trajectory weighting requires linear_jsd or entropy_jsd")
+            if r.temperature != 1 or r.top_p != 1 or r.top_k != -1 or r.repetition_penalty != 1:
+                raise ValueError("Trajectory weights require untruncated temperature-1 behavior logprobs")
+            seq["group_size"] = int(r.n)
+            a.dense_seq_weight = seq
         if a.dense_distill_mode != "off":
             if (
                 not m.use_remove_padding
@@ -255,10 +330,42 @@ def load_config(module, filename, overrides=(), root=ROOT):
             # Derived toggles prevent incompatible native reward/PG paths.
             t.reward_model.enable = False
             r.log_prob_top_k = 0
-            r.calculate_log_probs = False
+            r.calculate_log_probs = seq_enabled
             a.dense_teacher_path = t.reward_model.model.path
         elif not t.reward_model.enable:
             raise ValueError("Native OPD requires reward_model.enable=true")
+        if a.dense_distill_mode == "research":
+            from modules.rethinking.research_objective import validate_research
+            validate_research(OmegaConf.to_container(a.dense_research, resolve=True))
+            if r.temperature != 1 or r.top_p != 1 or r.top_k != -1:
+                raise ValueError("Research rollouts require temperature=1, top_p=1, top_k=-1")
+            rollout = t.get("research_rollout", {})
+            if rollout.get("mode", "online") not in {"online", "offline", "mixture", "schedule"}:
+                raise ValueError("Unknown research rollout source")
+            if rollout.get("mode", "online") != "online":
+                if not rollout.get("cache"):
+                    raise ValueError("Offline/mixed rollouts require a frozen token cache")
+                t.research_rollout.cache = local_path(rollout.cache, root)
+        progressive = t.get("progressive", {})
+        if progressive.get("enabled", False):
+            from modules.rethinking.progressive import validate_progressive_config
+
+            normalized_progressive = validate_progressive_config(progressive)
+            if normalized_progressive["seq_weight"]["mode"] != "off":
+                normalized_progressive["seq_weight"]["group_size"] = int(r.n)
+                t.progressive = normalized_progressive
+            if a.dense_distill_mode != "off" or r.log_prob_top_k != 0:
+                raise ValueError("Progressive alpha requires the sampled-token OPD path")
+            if not r.calculate_log_probs:
+                raise ValueError("Progressive alpha requires rollout behavior logprobs")
+            if a.ppo_epochs != 1 or a.ppo_mini_batch_size != t.data.train_batch_size:
+                raise ValueError("Alpha schedules require one optimizer update per rollout batch")
+            if a.entropy_coeff or a.use_kl_loss or t.algorithm.use_kl_in_reward:
+                raise ValueError("Alpha experiment cannot add entropy or reference KL losses")
+            if t.algorithm.norm_adv_by_std_in_grpo:
+                raise ValueError("Alpha experiment requires unnormalized advantages")
+            if r.temperature != 1 or r.top_p != 1 or r.top_k != -1:
+                raise ValueError("Alpha experiment requires untruncated, temperature-1 rollout")
         if r.top_k_strategy not in {
             "only_stu",
             "only_tch",
@@ -323,8 +430,27 @@ def validate_assets(config, module, *, evaluation_only=False):
             raise FileNotFoundError(f"Missing input: {name}. See data/README.md")
 
 
+RUN_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def run_date(now=None):
+    """Use the user's timezone rather than the host timezone for daily IDs."""
+    return (now or datetime.now(timezone.utc)).astimezone(RUN_TIMEZONE).date().isoformat()
+
+
+def is_dated_run(run, parent):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run.parent.name):
+        return False
+    try:
+        datetime.strptime(run.parent.name, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return (run.parent.parent == parent and run.name.isdigit()
+            and int(run.name) > 0 and run.is_dir())
+
+
 def allocate_run(root, module, dataset):
-    parent = Path(root) / module / dataset
+    parent = Path(root) / module / dataset / run_date()
     parent.mkdir(parents=True, exist_ok=True)
     number = (
         max((int(p.name) for p in parent.iterdir() if p.name.isdigit()), default=0) + 1
@@ -349,7 +475,22 @@ def snapshot_code(root, destination, module):
     # The math evaluator is shared; no other training module is required.
     shutil.copytree(root / "scripts", destination / "scripts", ignore=ignore)
     other = "run_rethinking.py" if module == "vOPD" else "run_vopd.py"
-    (destination / "scripts" / other).unlink()
+    (destination / "scripts" / other).unlink(missing_ok=True)
+
+
+def write_launch_record(run, record, **updates):
+    """Keep launch provenance and lifecycle status inside the numbered run."""
+    record.update(updates, updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=run, prefix=".launch-", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(record, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary, Path(run) / "launch.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def run_command(command, env, cwd, log):
@@ -415,6 +556,11 @@ def run_command(command, env, cwd, log):
 
 
 def launch(module, default_config):
+    def interrupted(signum, frame):
+        # Let run_command's finally block clean up its separately grouped workers.
+        raise KeyboardInterrupt(f"Received signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(
         description=f"One {module} experiment: train, save, evaluate"
     )
@@ -426,6 +572,7 @@ def launch(module, default_config):
         action="store_true",
         help="Validate and print config; no writes or GPU work",
     )
+    parser.add_argument("--reserved-run", type=Path, help="Numbered folder reserved by the study supervisor")
     parser.add_argument(
         "overrides", nargs="*", help="Optional YAML key=value overrides"
     )
@@ -434,11 +581,19 @@ def launch(module, default_config):
     if args.dry_run:
         print(OmegaConf.to_yaml(config, resolve=True))
         print(
-            f"Output: {config.run.output_root}/{module}/{config.run.dataset}/<next-number>"
+            f"Output: {config.run.output_root}/{module}/{config.run.dataset}/{run_date()}/<next-number>"
         )
         return 0
     validate_assets(config, module)
-    run = allocate_run(config.run.output_root, module, config.run.dataset)
+    if args.reserved_run:
+        run = args.reserved_run.resolve()
+        expected = Path(config.run.output_root).resolve() / module / config.run.dataset
+        if not is_dated_run(run, expected):
+            raise ValueError("Reserved run must be an existing date/number folder")
+        if any((run / name).exists() for name in ("launch.json", "checkpoint", "code")):
+            raise ValueError("Reserved run has already started; refusing to overwrite")
+    else:
+        run = allocate_run(config.run.output_root, module, config.run.dataset)
     print(f"Experiment: {run}", flush=True)
     (run / "configs").mkdir()
     (run / "checkpoint").mkdir()
@@ -448,9 +603,13 @@ def launch(module, default_config):
     config.run.python = python
     config_path = run / "configs" / default_config
     t = config.training
+    if module == "rethinking" and t.actor_rollout_ref.actor.dense_distill_mode == "research":
+        t.actor_rollout_ref.actor.dense_research.output_dir = str(run / "diagnostics")
+        if "research_rollout" in t:
+            t.research_rollout.probe_output = str(run / "diagnostics/probe_rollouts.jsonl")
     if module == "vOPD":
         t.output_dir = str(run / "checkpoint")
-        t.run_name = f"{module}-{config.run.dataset}-{run.name}"
+        t.run_name = f"{module}-{config.run.dataset}-{run.parent.name}-{run.name}"
         command = [
             python,
             "-m",
@@ -463,7 +622,8 @@ def launch(module, default_config):
         ]
     else:
         t.trainer.default_local_dir = str(run / "checkpoint")
-        t.trainer.experiment_name = f"rethinking-{config.run.dataset}-{run.name}"
+        t.trainer.rollout_data_dir = str(run / "rollouts")
+        t.trainer.experiment_name = f"rethinking-{config.run.dataset}-{run.parent.name}-{run.name}"
         t.custom_reward_function.path = str(
             run
             / "code/modules/rethinking/verl/utils/reward_score/ttrl_math/__init__.py"
@@ -471,8 +631,15 @@ def launch(module, default_config):
         command = [python, "-m", "verl.trainer.main_ppo", str(config_path)]
     env = dict(os.environ)
     env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
+    if "GPU_SCHEDULE_GPU_IDS" in env:
+        scheduled = [int(i) for i in env["GPU_SCHEDULE_GPU_IDS"].split(",")]
+        if scheduled != list(config.run.gpus) or not env.get("CUDA_VISIBLE_DEVICES"):
+            raise ValueError("GPU scheduler allocation must match run.gpus in order")
+        visible_devices = env["CUDA_VISIBLE_DEVICES"]
+    else:
+        visible_devices = ",".join(map(str, config.run.gpus))
     env.update(
-        CUDA_VISIBLE_DEVICES=",".join(map(str, config.run.gpus)),
+        CUDA_VISIBLE_DEVICES=visible_devices,
         PYTHONUNBUFFERED="1",
         PYTHONDONTWRITEBYTECODE="1",
         TOKENIZERS_PARALLELISM="false",
@@ -497,10 +664,28 @@ def launch(module, default_config):
         if module == "rethinking":
             t.ray_kwargs.ray_init._temp_dir = temporary
         OmegaConf.save(config, config_path, resolve=True)
+        record = {
+            "schema_version": 1,
+            "module": module,
+            "pid": os.getpid(),
+            "python": python,
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "run_date": run.parent.name,
+            "run_number": run.name,
+            "run_timezone": str(RUN_TIMEZONE),
+            "requested_config": "configs/requested.yaml",
+            "effective_config": str(config_path.relative_to(run)),
+            "overrides": list(args.overrides),
+        }
+        context = os.environ.get("OPD_LAUNCH_CONTEXT")
+        if context:
+            record["queue"] = json.loads(context)
+        write_launch_record(run, record, status="running", phase="training")
         try:
             run_command(command, env, code, log)
             final = run / "checkpoint/final"
             if module == "rethinking":
+                write_launch_record(run, record, phase="export")
                 step = int(
                     (run / "checkpoint/latest_checkpointed_iteration.txt").read_text()
                 )
@@ -549,6 +734,7 @@ def launch(module, default_config):
                         log,
                     )
             if config.evaluation.enabled:
+                write_launch_record(run, record, phase="evaluation")
                 run_command(
                     [
                         python,
@@ -563,13 +749,18 @@ def launch(module, default_config):
                     code,
                     log,
                 )
+                if module == "rethinking":
+                    write_launch_record(run, record, phase="storage_cleanup")
+                    cleanup_after_evaluation(run, python, log=log)
                 if module == "vOPD" and config.evaluation.get("complete_box_scoring", False):
                     run_command(
                         [python, "-m", "scripts.diagnose_complete_boxes", str(run)],
                         env, code, log,
                     )
             print("Experiment completed", file=log, flush=True)
+            write_launch_record(run, record, status="completed", phase="completed", finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         except BaseException as error:
             print(f"Experiment failed: {error}", file=log, flush=True)
+            write_launch_record(run, record, status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed", error=f"{type(error).__name__}: {error}", finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
             raise
     return 0

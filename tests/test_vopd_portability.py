@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -87,6 +88,24 @@ class PortabilityTests(unittest.TestCase):
             self.assertEqual(execute.call_count, 1)
             records = list(Path(config.run.output_root).rglob('launch.json'))
             self.assertEqual(json.loads(records[0].read_text())['status'], 'failed')
+
+    def test_student_preserves_scheduler_uuid_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            requested, config = self.fixture(Path(tmp)/'relocated OPD')
+            config.run.gpus = [7, 2]
+            config.evaluation.data_parallel_size = 2
+            def snapshot(_root, target, _module):
+                target.mkdir(parents=True)
+            allocation = {'GPU_SCHEDULE_GPU_IDS': '7,2',
+                          'CUDA_VISIBLE_DEVICES': 'GPU-seven,GPU-two'}
+            with patch.dict(os.environ, allocation), \
+                 patch.object(student, 'reserve_gpus', return_value=nullcontext()), \
+                 patch.object(student, 'snapshot_code', side_effect=snapshot), \
+                 patch.object(student, 'run_command') as execute:
+                student.evaluate_student(config, requested)
+            self.assertEqual(execute.call_count, 2)
+            for call in execute.call_args_list:
+                self.assertEqual(call.args[1]['CUDA_VISIBLE_DEVICES'], 'GPU-seven,GPU-two')
 
     def test_training_launcher_automatically_evaluates_final(self):
         with tempfile.TemporaryDirectory() as tmp:

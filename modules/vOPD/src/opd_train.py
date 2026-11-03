@@ -2,6 +2,9 @@ import os
 import sys
 from typing import Any
 
+from scripts._gpu_compat import enable_vllm_uuid_queries
+enable_vllm_uuid_queries()
+
 from peft import LoraConfig, TaskType
 from transformers import AutoTokenizer, set_seed
 
@@ -205,6 +208,16 @@ if __name__ == "__main__":
         prompt_length_limit=args.max_prompt_length,
         stop_weight=getattr(args, "stop_weight", 0.0),
         stop_token_ids=list(getattr(args, "stop_token_ids", [])),
+        token_gate_tau_q=getattr(args, "token_gate_tau_q", 0.5),
+        token_gate_stop=getattr(args, "token_gate_stop", False),
+        token_gate_stop_ids=list(getattr(args, "token_gate_stop_ids", [])),
+        token_gate_k_odds=getattr(args, "token_gate_k_odds", 1.0),
+        token_gate_clip=getattr(args, "token_gate_clip", None),
+        token_gate_progress=getattr(args, "token_gate_progress", None),
+        token_gate_ce_weight=getattr(args, "token_gate_ce_weight", None),
+        token_gate_response=getattr(args, "token_gate_response", None),
+        token_gate_beta=getattr(args, "token_gate_beta", None),
+        token_gate_normalize=getattr(args, "token_gate_normalize", True),
     )
 
     # TRL materializes the teacher dtype in-place while loading the model.
@@ -245,6 +258,7 @@ if __name__ == "__main__":
     result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     final_dir = os.path.join(output_dir, "final")
     trainer.save_model(final_dir)
+    trainer.save_token_progress(final_dir)
     if trainer.is_world_process_zero():
         tokenizer.save_pretrained(final_dir)
         if generation_stops:
