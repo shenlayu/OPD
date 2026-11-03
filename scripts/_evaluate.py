@@ -1,13 +1,75 @@
 """Final-checkpoint evaluation with one scores.json and one results.jsonl."""
 
+import hashlib
+import json
 import signal
 import sys
 from pathlib import Path
+
+from scripts._gpu_compat import enable_vllm_uuid_queries
+enable_vllm_uuid_queries()
 
 from omegaconf import OmegaConf
 
 from scripts._data import boxed_answer, load_rows, problem_and_answer
 from scripts._results import ResultWriter
+
+
+def load_reused_rows(config, checkpoint, tasks):
+    """Validate an existing complete evaluation before adding new sample IDs."""
+    source = config.evaluation.get("reuse_results")
+    if not source:
+        return []
+    if config.evaluation.seed_mode != "per_sample":
+        raise ValueError("Reusing samples requires per-sample seeds")
+    path = Path(source)
+    saved = json.loads(path.with_name("scores.json").read_text())
+    if saved.get("status") != "complete" or saved.get("module") != "rethinking":
+        raise ValueError("Reuse source must be a complete rethinking evaluation")
+    if Path(saved["checkpoint"]).resolve() != Path(checkpoint).resolve():
+        raise ValueError("Reuse source belongs to a different checkpoint")
+    old = saved["evaluation"]
+    new = OmegaConf.to_container(config.evaluation, resolve=True)
+    ignored = {"datasets", "data_parallel_size", "reuse_results"}
+    for key in (old.keys() | new.keys()) - ignored:
+        if old.get(key) != new.get(key):
+            raise ValueError(f"Evaluation protocol differs at {key}")
+    old_tasks = old["datasets"]
+    if len(old_tasks) != len(tasks):
+        raise ValueError("Reuse benchmark order/count differs")
+    expected = {}
+    for task_index, ((task, rows), prior) in enumerate(zip(tasks, old_tasks)):
+        for key in ("name", "path", "split", "limit"):
+            if task.get(key) != prior.get(key):
+                raise ValueError(f"Reuse dataset differs at {key}")
+        previous = prior["samples"]
+        if not isinstance(previous, int) or not 0 < previous < task.samples <= new["seed_example_stride"]:
+            raise ValueError("Target samples must extend the prior range without overlapping seeds")
+        if len(rows) * new["seed_example_stride"] > new["seed_task_stride"]:
+            raise ValueError("Evaluation task seed ranges overlap")
+        for index, row in enumerate(rows):
+            prompt, answer = problem_and_answer(row)
+            for sample in range(previous):
+                seed = new["seed"] + task_index * new["seed_task_stride"] + index * new["seed_example_stride"] + sample
+                expected[task.name, index, sample] = (prompt, answer, seed)
+    digest = hashlib.sha256()
+    reused, seen = [], set()
+    with path.open("rb") as handle:
+        for line in handle:
+            digest.update(line)
+            row = json.loads(line)
+            key = row["benchmark"], row["example_id"], row["sample_id"]
+            if key in seen or key not in expected:
+                raise ValueError(f"Duplicate or unexpected reused sample: {key}")
+            if (row["prompt"], row["answer"], row["seed"]) != expected[key]:
+                raise ValueError(f"Reused sample prompt/answer/seed differs: {key}")
+            if type(row["correct"]) is not bool or row.get("grading_error"):
+                raise ValueError(f"Reused sample lacks a valid grade: {key}")
+            seen.add(key)
+            reused.append(row)
+    if seen != expected.keys() or digest.hexdigest() != saved["results_sha256"]:
+        raise ValueError("Reuse source coverage or checksum differs")
+    return reused
 
 
 def stop_token_ids(tokenizer):
@@ -146,6 +208,8 @@ def evaluate_tasks(
                         correct=None,
                         grading_error=None,
                     )
+                    if e.get("save_token_ids", False):
+                        row["token_ids"] = list(completion.token_ids)
                     if module == "vOPD":
                         row["formatted"] = prediction is not None
                         row["predicted_answer"] = (
@@ -250,8 +314,10 @@ def load_tasks(config):
 
 def run_evaluation(
     config, module, checkpoint, writer, tasks, *, shard_rank=0, shard_world_size=1,
-    skip_samples=frozenset(),
 ):
+    reused = load_reused_rows(config, checkpoint, tasks)
+    skip_samples = {(row["benchmark"], row["example_id"], row["sample_id"]) for row in reused}
+    del reused
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -297,6 +363,7 @@ def main(config_path, module, checkpoint, output=None):
     config = OmegaConf.load(config_path)
     e = config.evaluation
     tasks = load_tasks(config)
+    reused = load_reused_rows(config, checkpoint, tasks)
     metadata = dict(
         module=module,
         dataset=config.run.dataset,
@@ -305,13 +372,20 @@ def main(config_path, module, checkpoint, output=None):
         config_file=f"configs/{Path(config_path).name}",
     )
     output = output or Path(config_path).resolve().parent.parent
+    if reused:
+        metadata["reused_samples"] = len(reused)
+        metadata["reuse_source"] = str(e.reuse_results)
+        print(f"EVAL preserving {len(reused)} existing samples; generating missing sample IDs only", flush=True)
     if e.get("data_parallel_size", 1) > 1:
         from scripts._parallel_evaluate import run_parallel
 
-        return run_parallel(config_path, config, module, checkpoint, output, tasks, metadata)
+        return run_parallel(config_path, config, module, checkpoint, output, tasks, metadata, initial_rows=reused)
     with ResultWriter(
         output, metadata, {t.name: (len(rows), t.samples) for t, rows in tasks}
     ) as writer:
+        for row in reused:
+            writer.write(row)
+        writer.flush()
         run_evaluation(config, module, checkpoint, writer, tasks)
 
 

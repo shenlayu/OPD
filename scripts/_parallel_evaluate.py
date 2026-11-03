@@ -13,6 +13,9 @@ import sys
 import time
 import uuid
 
+from scripts._gpu_compat import enable_vllm_uuid_queries
+enable_vllm_uuid_queries()
+
 from omegaconf import OmegaConf
 
 from scripts._results import ResultWriter
@@ -27,15 +30,29 @@ def validate_parallel_config(config, module=None):
         raise ValueError("Parallel evaluation requires seed_mode=per_sample")
     if e.tensor_parallel_size != 1:
         raise ValueError("Data-parallel evaluation currently requires tensor_parallel_size=1")
+    workers = e.get("max_parallel_workers")
+    workers = size if workers is None else workers
+    if type(workers) is not int or not 1 <= workers <= size:
+        raise ValueError("max_parallel_workers must be between 1 and data_parallel_size")
     devices = [str(gpu) for gpu in config.run.gpus]
-    if len(devices) < size or len(set(devices)) != len(devices):
+    if len(devices) < workers or len(set(devices)) != len(devices):
         raise ValueError("Parallel evaluation requires enough distinct run.gpus")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is not None:
+        scheduled = os.environ.get("GPU_SCHEDULE_GPU_IDS")
+        if scheduled is not None:
+            physical = [gpu.strip() for gpu in scheduled.split(",")]
+            allocated = [gpu.strip() for gpu in visible.split(",")]
+            if len(physical) != len(allocated) or len(set(physical)) != len(physical):
+                raise ValueError("Invalid GPU scheduler allocation")
+            mapping = dict(zip(physical, allocated))
+            if not set(devices[:workers]).issubset(mapping):
+                raise ValueError("Requested run.gpus are outside GPU scheduler allocation")
+            return [mapping[gpu] for gpu in devices[:workers]]
         allowed = {device.strip() for device in visible.split(",")}
-        if not set(devices[:size]).issubset(allowed):
+        if not set(devices[:workers]).issubset(allowed):
             raise ValueError("Requested run.gpus are outside CUDA_VISIBLE_DEVICES")
-    return devices[:size]
+    return devices[:workers]
 
 
 def drain_worker_rows(stream, writer):
@@ -82,9 +99,11 @@ def _interrupted(signum, _frame):
 
 def run_parallel(config_path, config, module, checkpoint, output, tasks, metadata, initial_rows=()):
     devices = validate_parallel_config(config, module)
+    shard_count = config.evaluation.data_parallel_size
     if config.evaluation.seed_mode == "engine":
         metadata = dict(metadata, evaluation_execution=dict(
             mode="independent_engines_question_shards", gpus=devices,
+            logical_shards=shard_count, max_parallel_workers=len(devices),
             engine_seed=config.evaluation.seed,
             random_stream_note="Each GPU uses the configured engine seed. Question sharding changes batching and RNG streams relative to a single GPU; bitwise-identical samples are not claimed.",
         ))
@@ -99,54 +118,57 @@ def run_parallel(config_path, config, module, checkpoint, output, tasks, metadat
                 writer.write(row)
             writer.flush()
             try:
-                for rank, device in enumerate(devices):
-                    rows_path = shard_dir / f"worker_{rank}.jsonl"
-                    rows_path.touch(exist_ok=False)
-                    # Read bytes so a concurrent write cannot expose a partial
-                    # UTF-8 character to the decoder before the newline arrives.
-                    streams.append(rows_path.open("rb"))
-                    log = (shard_dir / f"worker_{rank}.log").open("x", encoding="utf-8")
-                    logs.append(log)
-                    env = os.environ.copy()
-                    env.update(CUDA_VISIBLE_DEVICES=device, PYTHONUNBUFFERED="1")
-                    process = subprocess.Popen(
-                        [sys.executable, "-m", "scripts._parallel_evaluate",
-                         str(config_path), module, str(checkpoint), str(rows_path),
-                         str(rank), str(len(devices))],
-                        env=env, stdout=log, stderr=subprocess.STDOUT,
-                        start_new_session=True,
-                    )
-                    processes.append(process)
-                    print(
-                        f"EVAL worker={rank} gpu={device} pid={process.pid} "
-                        f"log={log.name}", flush=True,
-                    )
-                totals = [0] * len(devices)
-                last_report = time.monotonic()
-                while True:
-                    changed = False
-                    for rank, stream in enumerate(streams):
-                        count = drain_worker_rows(stream, writer)
-                        totals[rank] += count
-                        changed = changed or bool(count)
-                    if changed:
-                        writer.flush()
-                    statuses = [process.poll() for process in processes]
-                    failed = [(rank, code) for rank, code in enumerate(statuses)
-                              if code not in (None, 0)]
-                    if failed:
-                        raise RuntimeError(f"Evaluation workers failed: {failed}; logs: {shard_dir}")
-                    if changed or time.monotonic() - last_report >= 30:
-                        print(f"EVAL workers completed_samples={totals} total={sum(totals)}", flush=True)
-                        last_report = time.monotonic()
-                    if all(code == 0 for code in statuses):
-                        # Workers can flush their last records between the read and poll.
-                        for stream in streams:
-                            drain_worker_rows(stream, writer)
-                            if stream.read():
-                                raise RuntimeError("Evaluation worker left an incomplete JSONL record")
-                        break
-                    time.sleep(0.5)
+                totals = [0] * shard_count
+                # Logical rank/world size stays fixed when fewer physical GPUs
+                # are used. Thus each engine receives the same questions/order.
+                for wave_start in range(0, shard_count, len(devices)):
+                    wave_end = min(wave_start + len(devices), shard_count)
+                    for rank in range(wave_start, wave_end):
+                        device = devices[rank - wave_start]
+                        rows_path = shard_dir / f"worker_{rank}.jsonl"
+                        rows_path.touch(exist_ok=False)
+                        # Byte streams tolerate partial UTF-8 writes until newline.
+                        streams.append(rows_path.open("rb"))
+                        log = (shard_dir / f"worker_{rank}.log").open("x", encoding="utf-8")
+                        logs.append(log)
+                        env = os.environ.copy()
+                        env.update(CUDA_VISIBLE_DEVICES=device, PYTHONUNBUFFERED="1")
+                        process = subprocess.Popen(
+                            [sys.executable, "-m", "scripts._parallel_evaluate",
+                             str(config_path), module, str(checkpoint), str(rows_path),
+                             str(rank), str(shard_count)],
+                            env=env, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                        processes.append(process)
+                        print(f"EVAL worker={rank} gpu={device} pid={process.pid} log={log.name}", flush=True)
+                    last_report = time.monotonic()
+                    while True:
+                        changed = False
+                        for rank in range(wave_start, wave_end):
+                            count = drain_worker_rows(streams[rank], writer)
+                            totals[rank] += count
+                            changed = changed or bool(count)
+                        if changed:
+                            writer.flush()
+                        statuses = [process.poll() for process in processes]
+                        failed = [(rank + wave_start, code) for rank, code in enumerate(statuses)
+                                  if code not in (None, 0)]
+                        if failed:
+                            raise RuntimeError(f"Evaluation workers failed: {failed}; logs: {shard_dir}")
+                        if changed or time.monotonic() - last_report >= 30:
+                            print(f"EVAL workers completed_samples={totals} total={sum(totals)}", flush=True)
+                            last_report = time.monotonic()
+                        if all(code == 0 for code in statuses):
+                            for stream in streams[wave_start:wave_end]:
+                                drain_worker_rows(stream, writer)
+                                if stream.read():
+                                    raise RuntimeError("Evaluation worker left an incomplete JSONL record")
+                            break
+                        time.sleep(0.5)
+                    # Release engine descendants before reusing a physical GPU.
+                    _terminate_workers(processes)
+                    processes.clear()
                 scores = writer.flush()
                 for task, _rows in tasks:
                     metric = scores["benchmarks"][task.name]

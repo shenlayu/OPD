@@ -1,15 +1,45 @@
 from __future__ import annotations
 
 import math
+import json
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from transformers import TrainerCallback
+from transformers.trainer_utils import get_last_checkpoint
 
 from trl.experimental.minillm import MiniLLMTrainer
 from trl.trainer.utils import selective_log_softmax
 
 from modules.vOPD.src.grad_variance import GradientVarianceTracker
 from modules.vOPD.src.progressive_jsd import dense_jsd_loss, entropy_alpha_totals, linear_alpha
+from modules.vOPD.src.token_gate import (calibrate_clip, dense_token_gate_loss, validate_ablation,
+                                         validate_gate, validate_ce)
+from modules.vOPD.src.token_progress import TokenProgress, build_token_classes
+from modules.vOPD.src.token_progress_config import ProgressConfig
+from modules.vOPD.src.token_response import ResponseConfig
+
+
+class TokenProgressCallback(TrainerCallback):
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if self.trainer.token_progress.global_step != state.global_step:
+            raise ValueError("Scheme B history and Trainer checkpoint step disagree")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        trainer = self.trainer
+        report = trainer.token_progress.commit(state.global_step, trainer.accelerator.device)
+        if report is not None and trainer.is_world_process_zero():
+            directory = Path(args.output_dir).parent / "diagnostics"
+            directory.mkdir(parents=True, exist_ok=True)
+            with (directory / "token_progress.jsonl").open("a") as handle:
+                handle.write(json.dumps(report, allow_nan=False) + "\n")
+
+    def on_save(self, args, state, control, **kwargs):
+        self.trainer.save_token_progress(Path(args.output_dir) / f"checkpoint-{state.global_step}")
 
 
 class CustomMiniLLMTrainer(MiniLLMTrainer):
@@ -30,12 +60,22 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
         prompt_length_limit: int = 1024,
         stop_weight: float = 0.0,
         stop_token_ids=(),
+        token_gate_tau_q=0.5,
+        token_gate_stop=False,
+        token_gate_stop_ids=(),
+        token_gate_k_odds=1.0,
+        token_gate_clip=None,
+        token_gate_progress=None,
+        token_gate_ce_weight=None,
+        token_gate_response=None,
+        token_gate_beta=None,
+        token_gate_normalize=True,
         **kwargs,
     ):
         if reward_clip_lambda is not None and not 0.0 < reward_clip_lambda < 1.0:
             raise ValueError("reward_clip_lambda must be between 0 and 1")
         super().__init__(*args, **kwargs)
-        if dense_objective not in {"upstream", "progressive_jsd", "reverse_kl"}:
+        if dense_objective not in {"upstream", "progressive_jsd", "reverse_kl", "token_mix", "token_jsd"}:
             raise ValueError(f"Unknown dense objective: {dense_objective}")
         linear_alpha(0, 2, alpha_start, alpha_end)
         self.dense_objective = dense_objective
@@ -54,6 +94,42 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
         self.prompt_length_limit = prompt_length_limit
         self.stop_weight = float(stop_weight)
         self.stop_token_ids = tuple(stop_token_ids)
+        self.token_gate_tau_q = token_gate_tau_q
+        self.token_gate_stop = token_gate_stop
+        self.token_gate_stop_ids = tuple(token_gate_stop_ids)
+        self.token_gate_clip = token_gate_clip
+        if dense_objective in {"token_mix", "token_jsd"}:
+            validate_gate(dense_objective, token_gate_tau_q, token_gate_stop,
+                          self.token_gate_stop_ids, token_gate_k_odds, token_gate_clip)
+            if stop_weight or alpha_schedule != "linear":
+                raise ValueError("Token gate uses its own stop decomposition and no time schedule")
+        progress_config = ProgressConfig.parse(token_gate_progress)
+        validate_ce(dense_objective, token_gate_stop, progress_config.enabled, token_gate_ce_weight)
+        self.token_gate_ce_weight = token_gate_ce_weight
+        self.token_gate_response = ResponseConfig.parse(token_gate_response)
+        self.token_gate_response.validate_context(dense_objective, token_gate_stop, progress_config.enabled,
+                                                  token_gate_ce_weight, self.token_gate_stop_ids)
+        if dense_objective not in {"token_mix", "token_jsd"} and (token_gate_beta is not None or not token_gate_normalize):
+            raise ValueError("token_gate_beta / token_gate_normalize require token_mix or token_jsd")
+        validate_ablation(dense_objective, token_gate_beta, token_gate_normalize, token_gate_clip, token_gate_stop,
+                          progress_config.enabled, token_gate_ce_weight, self.token_gate_response.enabled)
+        self.token_gate_beta = token_gate_beta
+        self.token_gate_normalize = token_gate_normalize
+        self.token_progress = None
+        if progress_config.enabled:
+            if dense_objective not in {"token_mix", "token_jsd"}:
+                raise ValueError("Scheme B requires token_mix or token_jsd")
+            classes, fingerprint = build_token_classes(
+                self.processing_class, self.model.config.vocab_size, self.token_gate_stop_ids,
+                progress_config.class_overrides,
+            )
+            self.token_progress = TokenProgress(
+                progress_config.to_dict(), classes, classifier_fingerprint=fingerprint,
+                context=dict(objective=dense_objective, tau_q=token_gate_tau_q,
+                             split_stop=token_gate_stop, stop_ids=list(self.token_gate_stop_ids),
+                             kd_temperature=self.kd_temperature),
+            )
+            self.add_callback(TokenProgressCallback(self))
         if not math.isfinite(self.stop_weight) or self.stop_weight < 0:
             raise ValueError("stop_weight must be finite and nonnegative")
         if self.stop_weight and (dense_objective == "upstream" or not self.stop_token_ids):
@@ -76,6 +152,19 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
             if log_grad_variance
             else None
         )
+
+    def train(self, resume_from_checkpoint=None, *args, **kwargs):
+        if self.token_progress is not None and resume_from_checkpoint:
+            if resume_from_checkpoint is True:
+                resume_from_checkpoint = get_last_checkpoint(self.args.output_dir)
+                if resume_from_checkpoint is None:
+                    raise ValueError("No checkpoint found for Scheme B resume")
+            self.token_gate_clip = self.token_progress.load(resume_from_checkpoint, self.token_gate_clip)
+        return super().train(resume_from_checkpoint, *args, **kwargs)
+
+    def save_token_progress(self, directory):
+        if self.token_progress is not None and self.is_world_process_zero():
+            self.token_progress.save(directory, self.token_gate_clip)
 
     @staticmethod
     def _topk_log_softmax(logits, indices):
@@ -381,6 +470,8 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
             teacher = self.teacher_model(**kwargs)
         q = student.logits[:, prompt_length - 1 : -1, :]
         p = teacher.logits[:, prompt_length - 1 : -1, :]
+        if self.dense_objective in {"token_mix", "token_jsd"}:
+            return self.compute_token_gate_loss(q, p, inputs, student, return_outputs)
         progress = self._distill_progress()
         alpha, schedule = progress, self.alpha_schedule
         if schedule == "teacher_entropy_mean":
@@ -415,4 +506,38 @@ class CustomMiniLLMTrainer(MiniLLMTrainer):
         self._metrics[mode]["distill/peak_memory_gib"].append(
             torch.cuda.max_memory_allocated() / 2**30
         )
+        return (loss, student) if return_outputs else loss
+
+    def compute_token_gate_loss(self, student_logits, teacher_logits, inputs, student, return_outputs):
+        s = student_logits / self.kd_temperature
+        t = teacher_logits / self.kd_temperature
+        if self.token_gate_clip is None:
+            self.token_gate_clip, count = calibrate_clip(
+                s, t, inputs["completion_mask"], self.token_gate_tau_q,
+                self.token_gate_stop, self.token_gate_stop_ids, self.loss_token_chunk_size,
+            )
+            if self.accelerator.is_main_process:
+                directory = Path(self.args.output_dir).parent / "diagnostics"
+                directory.mkdir(parents=True, exist_ok=True)
+                record = dict(clip=self.token_gate_clip, gated_token_count=count,
+                              calibration="first_global_training_microbatch_gated_beta_fkl_p95",
+                              tau_q=self.token_gate_tau_q, split_stop=self.token_gate_stop,
+                              objective=self.dense_objective, global_step=self.state.global_step)
+                (directory / "token_gate_calibration.json").write_text(json.dumps(record, indent=2) + "\n")
+                print(f"Token gate clip calibration: {record}", flush=True)
+        loss, metrics = dense_token_gate_loss(
+            s, t, inputs["completion_mask"], tau_q=self.token_gate_tau_q,
+            kind=self.dense_objective, split_stop=self.token_gate_stop,
+            stop_ids=self.token_gate_stop_ids, clip=self.token_gate_clip,
+            token_chunk_size=self.loss_token_chunk_size,
+            progress=self.token_progress, observe_progress=self.model.training,
+            ce_weight=self.token_gate_ce_weight,
+            response=self.token_gate_response, sampled_ids=inputs["completion_ids"],
+            fixed_beta=self.token_gate_beta, normalize=self.token_gate_normalize,
+        )
+        mode = "train" if self.model.training else "eval"
+        for key, value in metrics.items():
+            self._metrics[mode]["token_gate/" + key].append(value.item())
+        self._metrics[mode]["distill/loss"].append(loss.detach().item())
+        self._metrics[mode]["distill/completion_tokens"].append(inputs["completion_mask"].sum().item())
         return (loss, student) if return_outputs else loss

@@ -32,8 +32,15 @@ def evaluate_student(config, requested_config):
         config_path = run / "configs/vopd.yaml"
         OmegaConf.save(config, config_path, resolve=True)
         env = dict(os.environ)
+        if "GPU_SCHEDULE_GPU_IDS" in env:
+            scheduled = [int(i) for i in env["GPU_SCHEDULE_GPU_IDS"].split(",")]
+            if scheduled != list(config.run.gpus) or not env.get("CUDA_VISIBLE_DEVICES"):
+                raise ValueError("GPU scheduler allocation must match run.gpus in order")
+            visible_devices = env["CUDA_VISIBLE_DEVICES"]
+        else:
+            visible_devices = ",".join(map(str, config.run.gpus))
         env.update(
-            CUDA_VISIBLE_DEVICES=",".join(map(str, config.run.gpus)),
+            CUDA_VISIBLE_DEVICES=visible_devices,
             PYTHONPATH=str(run / "code"), PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1",
             OMP_NUM_THREADS=str(config.run.threads), MKL_NUM_THREADS=str(config.run.threads),
             TOKENIZERS_PARALLELISM="false",

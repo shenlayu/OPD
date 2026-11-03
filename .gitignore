@@ -8,5 +8,12 @@ outputs/
 !/data/*.md
 /model/*
 !/model/*.md
-tests/
+tests
+!/tests/
+/tests/*
+!/tests/test_vopd_token_progress.py
+!/tests/test_vopd_token_ce.py
+!/tests/test_parallel_evaluate.py
+!/tests/test_vopd_token_gate.py
+!/tests/test_vopd_core_ablation.py
 /.gpu_locks/

@@ -39,6 +39,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--reserved-run", type=Path)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config("vOPD", args.config, args.overrides)
