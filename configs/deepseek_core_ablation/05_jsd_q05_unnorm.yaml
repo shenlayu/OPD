@@ -105,33 +105,33 @@ evaluation:
   - name: math500
     path: data/math500/test.parquet
     split: test
-    samples: 4
+    samples: 8
     limit: null
   - name: minerva
     path: data/minerva/test.parquet
     split: test
-    samples: 4
+    samples: 8
     limit: null
   - name: amc23
     path: data/amc23/test.parquet
     split: test
-    samples: 4
+    samples: 8
     limit: null
   - name: aime24
     path: data/aime24/test.parquet
     split: test
-    samples: 4
+    samples: 8
     limit: null
   - name: aime25
     path: data/aime25/test.parquet
     split: test
-    samples: 4
+    samples: 8
     limit: null
   prompt_style: plain_math
   enable_thinking: false
   max_prompt_length: 1024
-  max_new_tokens: 8192
-  max_model_len: 9216
+  max_new_tokens: 32768
+  max_model_len: 33792
   temperature: 0.6
   top_p: 0.9
   top_k: -1

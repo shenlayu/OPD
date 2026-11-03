@@ -1,8 +1,8 @@
 # DeepSeek 核心消融（五组）
 
 针对 CG-JSD 三个命题中还没有单独验证过的三个组件：**限幅**、**c_t 门控 vs 常数 β**、**1/(1−β) 归一化**。
-除下表列出的键外，五组与 [`../deepseek_token_gate/04_jsd_q05.yaml`](../deepseek_token_gate/04_jsd_q05.yaml)（A04，方案 A JSD q05）逐项相同；
-`tests/test_vopd_core_ablation.py` 会检查这一点。不扫多 seed，全部 seed=42。
+训练部分除下表列出的键外，五组与 [`../deepseek_token_gate/04_jsd_q05.yaml`](../deepseek_token_gate/04_jsd_q05.yaml)（A04，方案 A JSD q05）逐项相同；
+评测改为回答上限 32768、每题 8 条，其余评测设置不变。`tests/test_vopd_core_ablation.py` 会检查这两点。不扫多 seed，全部 seed=42。
 
 | 编号 | 配置 | dense_objective | β | C_F | 归一化 | 对照（已有） | 回答的问题 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -47,18 +47,22 @@ LoRA r64/alpha128/dropout0.05，LR=1e-5 cosine；训练生成上限 2048，tempe
 完整词表损失、128-token loss chunk、逐序列平均；核对初始 LoRA SHA256
 `4460b8025f2a60d82df0234014a92e08101ed61efb15bd34216c46de2dab3f13`。
 
-训练结束后自动评测 final：MATH500、Minerva、AMC23、AIME24、AIME25，每题 4 条，
-回答上限 8192，temperature=0.6、top_p=0.9、seed=42，8 个评测引擎，之后做 complete-box 重评分。
+训练结束后自动评测 final：MATH500、Minerva、AMC23、AIME24、AIME25，每题 8 条，
+回答上限 32768（总长度上限 33792），temperature=0.6、top_p=0.9、seed=42，8 个评测引擎，之后做 complete-box 重评分。
+这与此前 A04 / A07 的 32k 补评协议相同（`outputs/analysis/deepseek_32k_avg16_20261030/`），只是那次每题 16 条。
 
-## 已有对照结果
+## 已有对照结果（32k）
 
-8k avg@4 五项宏平均，读取 `diagnostics/complete_box_scores.json` 的 `last_complete`，单 seed：
+回答上限 32768，按最后一个完整答案框判分（`last_complete`），单 seed、每题 16 条。
+avg@n 是单条回答正确率的估计，期望不随 n 变化，所以可以直接和新组的 avg@8 比，只是 avg@16 方差更小。
 
-| ID | 实验 | 宏 avg@4 |
-| --- | --- | ---: |
-| A04 | JSD q05，带限幅 | 47.17 |
-| A01 | KL 混合 q05，带限幅 | 43.75 |
-| A07 | 纯 RKL | 43.32 |
+| ID | 实验 | MATH500 | Minerva | AMC23 | AIME24 | AIME25 | 宏 avg |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A04 | JSD q05，带限幅 | 83.35 | 31.25 | 75.78 | 42.92 | 30.00 | 52.66 |
+| B2048_psi0 | A04 的梯度等价复现（4 卡） | 84.39 | 31.41 | 77.34 | 42.92 | 30.63 | 53.34 |
+| A07 | 纯 RKL | 82.95 | 32.01 | 74.38 | 42.71 | 26.04 | 51.62 |
+| A01 | KL 混合 q05，带限幅 | 未测 | 未测 | 未测 | 未测 | 未测 | — |
 
-A04 的梯度等价复现有两次：B01（方案 B 未触发）44.67，B2048_psi0（4 卡）45.33。
-同一配置运行间差约 2.5pp，单组差值小于这个量级时不能当作结论。
+A04 与 RKL 的差为 +1.04pp，题目 bootstrap 区间 [−0.22, +2.34]，不含训练 seed 方差。
+32k 下只有 A04 / B2048_psi0 这一对复现（差 0.68pp），运行间噪声还没有可靠估计。
+A01 的 final checkpoint 还没做 32k 评测，02 组暂时缺这一格对照。
