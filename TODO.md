@@ -156,26 +156,7 @@ A01 还没有 32k 结果，02 组暂时缺这一格对照。
 | A07 | 纯 RKL（已有，avg@16） | 82.95 | 32.01 | 74.38 | 42.71 | 26.04 | 51.62 | — |
 | A01 | KL 混合 q05，带限幅（32k 未测） | | | | | | | |
 | 01 | JSD q05，无限幅 | | | | | | | |
-| 02 | KL 混合 q05，无限幅 | | | | | | | |
+| 02 | 全局 FKL | | | | | | | |
 | 03 | 固定 β=0.5 JSD | | | | | | | |
-| 04 | 全局 FKL | | | | | | | |
+| 04 | KL 混合 q05，无限幅 | | | | | | | |
 | 05 | JSD q05，无归一化 | | | | | | | |
-
-### 7. 可选：Minerva 重新判分（不改主流程）
-
-主流程和上表一律用原判分器。原判分器在 Minerva 上会漏判正确答案：272 题中有 58 题的标准答案是 `4.5e33`
-这种 Python 科学计数法，模型写成 `4.5 \times 10^{33}` 一律判错；很多小数标准答案是四舍五入后的值，模型多写一位也会判错。
-
-`scripts/rescore_minerva.py` 只对 Minerva 的最后一个完整答案框重新判分：只会把错改对，不会把对改错；
-其它 benchmark 原样保留，也不修改 `scores.json` 和 `complete_box_scores.json`。
-
-- 标准答案是单个数时：预测也必须是单个数（可带单位），按标准答案的有效数字四舍五入后相等；整数答案必须完全相等。
-- 其它 Python 写法的标准答案（`np.arcsin`、`3./2`）改写成 LaTeX 后交给原判分器。
-
-```bash
-.venv-vopd/bin/python scripts/rescore_minerva.py outputs/vOPD/dapo14k_deepseek_core_01_jsd_q05_noclip/<日期>/<编号>
-```
-
-可以一次传多个运行目录。结果写到各运行的 `diagnostics/minerva_normalized_scores.json` 和 `minerva_normalized_cases.jsonl`。
-在已有 32k 结果上，它让各模型的 Minerva 都提高约 8pp（RKL 32.01 → 40.00，B2048_psi0 31.41 → 39.59），
-模型之间的差几乎不变。需要时在表后另附一列，不要和原判分器的数字混在同一列。
